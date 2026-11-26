@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.png" alt="YT-Niusic icon" width="96" />
+</p>
+
 # YT-Niusic
 
 Reproductor de consola (TUI) ultraliviano y retro (**Amber Monochrome Console**) para **YouTube Music**, escrito 100% en **Rust** (`ratatui` + `rustypipe` + `rodio`/`symphonia` + `stream-download` + `souvlaki`), sin Chromium/Electron ni dependencias externas obligatorias.
