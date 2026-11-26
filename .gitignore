@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Credenciales y cookies locales (nunca versionar)
+*cookie*
+*cookies*
+*auth*
+*token*
+!src/**/*.rs
+*.env
+.env*
+rustypipe_cache.json
+*.dpapi
+*.dpapi.tmp
