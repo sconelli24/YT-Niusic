@@ -1344,8 +1344,8 @@ impl TuiApp {
     }
 
     fn draw_login_screen(&self, frame: &mut Frame, area: Rect) {
-        let card_w = area.width.saturating_sub(4).min(80);
-        let card_h = area.height.saturating_sub(2).min(24);
+        let card_w = area.width.saturating_sub(4).min(84);
+        let card_h = area.height.saturating_sub(2).min(28);
         let x = area.x + area.width.saturating_sub(card_w) / 2;
         let y = area.y + area.height.saturating_sub(card_h) / 2;
         let card_area = Rect::new(x, y, card_w, card_h);
@@ -1357,9 +1357,8 @@ impl TuiApp {
         let vault = self.paths.data_dir.join(ENCRYPTED_SESSION_FILE);
 
         let mut lines = vec![
-            Line::from(""),
             Line::from(Span::styled(
-                "  YT-NIUSIC // YOUTUBE MUSIC CONSOLE",
+                format!("  YT-NIUSIC v{CURRENT_VERSION} // YOUTUBE MUSIC CONSOLE"),
                 Style::default()
                     .fg(AMBER_BRIGHT)
                     .add_modifier(Modifier::BOLD),
@@ -1368,21 +1367,12 @@ impl TuiApp {
                 "  ────────────────────────────────────────────────────────────────────",
                 Style::default().fg(BRONZE),
             )),
-            Line::from(""),
             Line::from(Span::styled(
-                "  Inicia sesión con tu cuenta de Google para acceder a tu Biblioteca,",
+                "  Inicia sesión con Google para acceder a Biblioteca, Historial, Me gusta",
                 Style::default().fg(AMBER_MAIN),
             )),
             Line::from(Span::styled(
-                "  Historial, Me gusta, Álbumes guardados y Radio personalizada.",
-                Style::default().fg(AMBER_MAIN),
-            )),
-            Line::from(Span::styled(
-                "  La sesión queda cifrada en este dispositivo (Windows DPAPI): al",
-                Style::default().fg(AMBER_DIM),
-            )),
-            Line::from(Span::styled(
-                "  reabrir YT-Niusic entrarás directo sin volver a iniciar sesión.",
+                "  y Radio personalizada. Queda cifrada con Windows DPAPI en este equipo.",
                 Style::default().fg(AMBER_DIM),
             )),
             Line::from(""),
@@ -1401,6 +1391,37 @@ impl TuiApp {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
+        ];
+
+        if let Some(fb) = &self.auth_feedback {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  > {fb}"),
+                Style::default()
+                    .fg(if fb.starts_with("ERR") {
+                        AMBER_ALERT
+                    } else {
+                        AMBER_BRIGHT
+                    })
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        if let Some(upd) = &self.available_update {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  [u] NUEVA VERSIÓN DISPONIBLE: v{} (actual v{}) — Presiona [u] para actualizar",
+                    upd.version, CURRENT_VERSION
+                ),
+                Style::default()
+                    .bg(AMBER_MAIN)
+                    .fg(BG_OBSIDIAN)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        lines.extend([
             Line::from(""),
             Line::from(Span::styled(
                 "  [o]  Vincular con código Google TV (abre google.com/device)",
@@ -1422,7 +1443,7 @@ impl TuiApp {
                 },
                 Style::default().fg(AMBER_DIM),
             )),
-        ];
+        ]);
 
         if self.input_mode == InputMode::PasteCookie {
             let masked = "*".repeat(self.cookie_input.len().min(42));
@@ -1432,34 +1453,6 @@ impl TuiApp {
                 Style::default()
                     .bg(AMBER_MAIN)
                     .fg(BG_OBSIDIAN)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-
-        if let Some(upd) = &self.available_update {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  [u] NUEVA VERSIÓN DISPONIBLE: v{} (actual v{}) — Presiona [u] para actualizar",
-                    upd.version, CURRENT_VERSION
-                ),
-                Style::default()
-                    .bg(AMBER_MAIN)
-                    .fg(BG_OBSIDIAN)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-
-        if let Some(fb) = &self.auth_feedback {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!("  > {fb}"),
-                Style::default()
-                    .fg(if fb.starts_with("ERR") {
-                        AMBER_ALERT
-                    } else {
-                        AMBER_BRIGHT
-                    })
                     .add_modifier(Modifier::BOLD),
             )));
         }

@@ -24,8 +24,9 @@ use crate::security::{
 pub const GOOGLE_YTM_LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=https%3A%2F%2Fmusic.youtube.com%2F";
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
-const POLL_INTERVAL: Duration = Duration::from_millis(750);
+const CDP_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(800);
+const AUTH_DIAG_LOG: &str = "auth_last.log";
 
 /// Navegador Chromium detectado en el equipo para abrir la ventana aislada de Google Sign-In.
 #[derive(Debug, Clone)]
@@ -78,8 +79,8 @@ pub fn detect_chromium_browser() -> Option<DetectedBrowser> {
         let local = std::env::var("LOCALAPPDATA").ok();
 
         let candidates: &[(&str, &str)] = &[
-            ("Microsoft Edge", r"Microsoft\Edge\Application\msedge.exe"),
             ("Google Chrome", r"Google\Chrome\Application\chrome.exe"),
+            ("Microsoft Edge", r"Microsoft\Edge\Application\msedge.exe"),
             (
                 "Brave",
                 r"BraveSoftware\Brave-Browser\Application\brave.exe",
@@ -106,8 +107,8 @@ pub fn detect_chromium_browser() -> Option<DetectedBrowser> {
 
         // Respaldo buscando en PATH
         for (label, bin) in [
-            ("Microsoft Edge", "msedge.exe"),
             ("Google Chrome", "chrome.exe"),
+            ("Microsoft Edge", "msedge.exe"),
             ("Brave", "brave.exe"),
         ] {
             if let Some(found) = find_in_path(bin) {
@@ -434,6 +435,25 @@ async fn teardown_browser_and_profile(
     .await;
 }
 
+fn write_diag_log(data_dir: &Path, lines: &[String]) {
+    let path = data_dir.join(AUTH_DIAG_LOG);
+    let _ = std::fs::write(path, lines.join("\n") + "\n");
+}
+
+async fn fetch_cdp_ws_url(http: &sd_reqwest::Client, version_url: &str) -> Option<String> {
+    let resp = http.get(version_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    let info = serde_json::from_str::<CdpVersionInfo>(&body).ok()?;
+    if info.web_socket_debugger_url.is_empty() {
+        None
+    } else {
+        Some(info.web_socket_debugger_url)
+    }
+}
+
 /// Abre una ventana aislada del navegador instalado en la página oficial de Google Sign-In,
 /// espera a que el usuario complete el inicio de sesión en `music.youtube.com`, valida y guarda
 /// la sesión mediante `validate_cookie`, y destruye el perfil temporal al terminar.
@@ -448,14 +468,21 @@ where
     V: FnMut(String) -> Fut,
     Fut: Future<Output = Result<CookieFilterStats>>,
 {
+    let mut diag: Vec<String> = Vec::new();
     let browser = detect_chromium_browser().ok_or_else(|| {
         anyhow!(
-            "No se encontró Edge, Chrome ni Brave instalado. Usa OAuth TV [o] o importa cookies [i]/[c]."
+            "No se encontró Chrome, Edge ni Brave instalado. Usa OAuth TV [o] o importa cookies [i]/[c]."
         )
     })?;
 
     let port = reserve_free_loopback_port()?;
     let profile_dir = create_ephemeral_profile_dir(data_dir)?;
+    diag.push(format!(
+        "browser={} path={} port={}",
+        browser.name,
+        browser.path.display(),
+        port
+    ));
 
     on_status(format!(
         "LAUNCHING {} // COMPLETE GOOGLE SIGN-IN... [ESC TO CANCEL]",
@@ -464,16 +491,15 @@ where
 
     let mut cmd = tokio::process::Command::new(&browser.path);
     cmd.args([
-        format!("--app={GOOGLE_YTM_LOGIN_URL}"),
+        "--new-window".to_string(),
+        GOOGLE_YTM_LOGIN_URL.to_string(),
         format!("--user-data-dir={}", profile_dir.display()),
         format!("--remote-debugging-port={port}"),
         "--remote-debugging-address=127.0.0.1".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-sync".to_string(),
-        "--disable-extensions".to_string(),
-        "--disable-background-networking".to_string(),
-        "--window-size=520,720".to_string(),
+        "--window-size=560,740".to_string(),
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -482,6 +508,8 @@ where
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            diag.push(format!("spawn_err={e}"));
+            write_diag_log(data_dir, &diag);
             let p = profile_dir.clone();
             let _ = tokio::task::spawn_blocking(move || secure_cleanup_auth_profile(&p)).await;
             return Err(anyhow!("No se pudo abrir {}: {e}", browser.name));
@@ -490,60 +518,79 @@ where
 
     let http = sd_reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
         .build()
         .context("No se pudo crear el cliente HTTP local para CDP")?;
 
     let version_url = format!("http://127.0.0.1:{port}/json/version");
-    let startup_deadline = Instant::now() + CDP_STARTUP_TIMEOUT;
-    let mut ws_url: Option<String> = None;
+    let startup_started = Instant::now();
+    let startup_deadline = startup_started + CDP_STARTUP_TIMEOUT;
+    let mut cdp_opt: Option<CdpClient> = None;
+    let mut child_exited_seen = false;
+    let mut exit_after_cdp_fail = 0u8;
 
     while Instant::now() < startup_deadline {
         if cancel_rx.try_recv().is_ok() {
+            diag.push("cancelled_during_startup".into());
+            write_diag_log(data_dir, &diag);
             teardown_browser_and_profile(None, child, profile_dir).await;
             return Err(anyhow!("Inicio de sesión cancelado por el usuario"));
         }
-        if let Ok(Some(_)) = child.try_wait() {
-            teardown_browser_and_profile(None, child, profile_dir).await;
-            return Err(anyhow!(
-                "La ventana de {} se cerró antes de completar el inicio de sesión",
-                browser.name
-            ));
+
+        if let Some(ws_url) = fetch_cdp_ws_url(&http, &version_url).await {
+            diag.push("cdp_version_ok".into());
+            match CdpClient::connect(&ws_url).await {
+                Ok(client) => {
+                    diag.push("cdp_ws_connected".into());
+                    cdp_opt = Some(client);
+                    break;
+                }
+                Err(e) => {
+                    diag.push(format!("cdp_ws_retry={e}"));
+                }
+            }
+        } else if !child_exited_seen
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            child_exited_seen = true;
+            diag.push(format!("launcher_exited={status}"));
         }
 
-        if let Ok(resp) = http.get(&version_url).send().await
-            && resp.status().is_success()
-            && let Ok(body) = resp.text().await
-            && let Ok(info) = serde_json::from_str::<CdpVersionInfo>(&body)
-            && !info.web_socket_debugger_url.is_empty()
-        {
-            ws_url = Some(info.web_socket_debugger_url);
-            break;
+        // Si el proceso lanzador ya terminó y tras varios reintentos CDP sigue sin responder,
+        // el navegador realmente se cerró o falló al arrancar.
+        if child_exited_seen && startup_started.elapsed() >= Duration::from_secs(4) {
+            exit_after_cdp_fail += 1;
+            if exit_after_cdp_fail >= 8 {
+                diag.push("aborted_launcher_exited_no_cdp".into());
+                write_diag_log(data_dir, &diag);
+                teardown_browser_and_profile(None, child, profile_dir).await;
+                return Err(anyhow!(
+                    "{} se cerró antes de abrir el canal local de inicio de sesión",
+                    browser.name
+                ));
+            }
         }
 
         tokio::select! {
             _ = &mut cancel_rx => {
+                diag.push("cancelled_during_startup_wait".into());
+                write_diag_log(data_dir, &diag);
                 teardown_browser_and_profile(None, child, profile_dir).await;
                 return Err(anyhow!("Inicio de sesión cancelado por el usuario"));
             }
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
         }
     }
 
-    let Some(ws_url) = ws_url else {
+    let Some(mut cdp) = cdp_opt else {
+        diag.push("cdp_startup_timeout".into());
+        write_diag_log(data_dir, &diag);
         teardown_browser_and_profile(None, child, profile_dir).await;
         return Err(anyhow!(
-            "No se pudo conectar con la ventana de {} (CDP loopback no respondió)",
-            browser.name
+            "No se pudo conectar con la ventana de {} tras {}s (CDP loopback no respondió)",
+            browser.name,
+            CDP_STARTUP_TIMEOUT.as_secs()
         ));
-    };
-
-    let mut cdp = match CdpClient::connect(&ws_url).await {
-        Ok(c) => c,
-        Err(e) => {
-            teardown_browser_and_profile(None, child, profile_dir).await;
-            return Err(e);
-        }
     };
 
     on_status(format!(
@@ -553,28 +600,65 @@ where
 
     let login_deadline = Instant::now() + LOGIN_TIMEOUT;
     let mut validation_attempts = 0u8;
+    let mut consecutive_cdp_errors = 0u8;
+    let mut empty_pages_count = 0u8;
 
     let result: Result<CookieFilterStats> = loop {
         if Instant::now() >= login_deadline {
+            diag.push("login_timeout".into());
             break Err(anyhow!(
                 "Tiempo agotado (5 min) esperando el inicio de sesión en Google"
             ));
         }
 
-        if let Ok(Some(_)) = child.try_wait() {
-            break Err(anyhow!(
-                "Inicio de sesión cancelado (se cerró la ventana del navegador)"
-            ));
-        }
-
         let targets = match cdp.get_targets().await {
-            Ok(t) => t,
-            Err(_) => {
-                break Err(anyhow!(
-                    "Inicio de sesión cancelado (la ventana del navegador se cerró)"
-                ));
+            Ok(t) => {
+                consecutive_cdp_errors = 0;
+                t
+            }
+            Err(e) => {
+                consecutive_cdp_errors += 1;
+                diag.push(format!("cdp_targets_err#{consecutive_cdp_errors}={e}"));
+
+                // Intentamos reconectar el WebSocket antes de asumir que el navegador se cerró
+                if let Some(ws_url) = fetch_cdp_ws_url(&http, &version_url).await
+                    && let Ok(reconnected) = CdpClient::connect(&ws_url).await
+                {
+                    diag.push("cdp_reconnected".into());
+                    cdp = reconnected;
+                    consecutive_cdp_errors = 0;
+                    continue;
+                }
+
+                if consecutive_cdp_errors >= 4 {
+                    break Err(anyhow!(
+                        "La ventana de {} se cerró antes de completar el inicio de sesión",
+                        browser.name
+                    ));
+                }
+
+                tokio::select! {
+                    _ = &mut cancel_rx => {
+                        diag.push("cancelled_during_cdp_retry".into());
+                        break Err(anyhow!("Inicio de sesión cancelado por el usuario"));
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                }
             }
         };
+
+        let page_count = targets.iter().filter(|t| t.target_type == "page").count();
+        if page_count == 0 {
+            empty_pages_count += 1;
+            if empty_pages_count >= 3 {
+                diag.push("all_pages_closed".into());
+                break Err(anyhow!(
+                    "Inicio de sesión cancelado (se cerró la ventana del navegador)"
+                ));
+            }
+        } else {
+            empty_pages_count = 0;
+        }
 
         let on_ytm = targets
             .iter()
@@ -583,10 +667,14 @@ where
         if on_ytm {
             let cookies = match cdp.get_cookies().await {
                 Ok(c) => c,
-                Err(_) => {
-                    break Err(anyhow!(
-                        "No se pudieron leer las cookies de sesión desde el navegador"
-                    ));
+                Err(e) => {
+                    diag.push(format!("cdp_cookies_err={e}"));
+                    tokio::select! {
+                        _ = &mut cancel_rx => {
+                            break Err(anyhow!("Inicio de sesión cancelado por el usuario"));
+                        }
+                        _ = tokio::time::sleep(POLL_INTERVAL) => continue,
+                    }
                 }
             };
 
@@ -596,19 +684,27 @@ where
                 // Breve pausa para que music.youtube.com termine de asentar cookies finales
                 tokio::select! {
                     _ = &mut cancel_rx => {
+                        diag.push("cancelled_during_settle".into());
                         break Err(anyhow!("Inicio de sesión cancelado por el usuario"));
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(600)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(750)) => {}
                 }
 
                 let settled_cookies = cdp.get_cookies().await.unwrap_or(cookies);
                 let header = build_cookie_header_from_cdp(&settled_cookies);
 
                 match validate_cookie(header.to_string()).await {
-                    Ok(stats) => break Ok(stats),
+                    Ok(stats) => {
+                        diag.push(format!("auth_ok kept={} dropped={}", stats.kept, stats.dropped));
+                        break Ok(stats);
+                    }
                     Err(e) => {
                         validation_attempts += 1;
-                        if validation_attempts >= 6 {
+                        diag.push(format!("validate_err#{validation_attempts}={e}"));
+                        on_status(format!(
+                            "VALIDATING SESSION (RETRY {validation_attempts}/10)..."
+                        ));
+                        if validation_attempts >= 10 {
                             break Err(anyhow!(
                                 "No se pudo validar la sesión capturada tras varios intentos: {e}"
                             ));
@@ -620,12 +716,14 @@ where
 
         tokio::select! {
             _ = &mut cancel_rx => {
+                diag.push("cancelled_by_user".into());
                 break Err(anyhow!("Inicio de sesión cancelado por el usuario"));
             }
             _ = tokio::time::sleep(POLL_INTERVAL) => {}
         }
     };
 
+    write_diag_log(data_dir, &diag);
     teardown_browser_and_profile(Some(cdp), child, profile_dir).await;
     result
 }
