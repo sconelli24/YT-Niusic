@@ -389,15 +389,18 @@ impl YtmClient {
 
     /// Resuelve la URL del stream de audio de mayor calidad compatible con decodificación nativa (M4A/AAC).
     ///
-    /// Prioriza clientes de alta fiabilidad y máxima calidad (incluyendo 256kbps AAC si la cuenta tiene Premium),
-    /// verificando rápidamente que la URL no devuelva 403 antes de iniciar la reproducción.
+    /// Prioriza clientes de alta fiabilidad sin corte de 1 MB (primero `VISIONOS` nativo y luego respaldos
+    /// de RustyPipe), verificando tanto el inicio del stream como un bloque posterior a 1 MB antes de reproducir.
     pub async fn resolve_audio_stream(&self, video_id: &str) -> Result<ResolvedAudio> {
+        // 1) Cliente nativo VISIONOS: entrega streams AAC/M4A directos completos sin corte 403 al 1 MB (~50s).
+        let visitor_data = self.rp.query().get_visitor_data(false).await.ok();
+        if let Ok(resolved) = resolve_via_visionos(video_id, visitor_data.as_deref()).await {
+            return Ok(resolved);
+        }
+
         let status = self.auth_status();
 
-        // Orden inteligente de clientes para máxima calidad y estabilidad:
-        // - Si hay OAuth TV, Tv suele entregar streams sin PO token y con cuenta autenticada.
-        // - Ios / Android entregan streams limpios M4A/AAC sin PO token.
-        // - Desktop (con cookies) puede entregar 256kbps AAC Premium si el entorno lo permite.
+        // 2) Respaldos de RustyPipe si VISIONOS no estuviera disponible para alguna pista específica.
         let mut attempts: Vec<(ClientType, bool)> = Vec::new();
         if status.has_oauth {
             attempts.push((ClientType::Tv, true));
@@ -434,7 +437,8 @@ impl YtmClient {
             };
 
             let ua = query.user_agent(player.client_type).into_owned();
-            if probe_stream_url(&best.url, &ua).await {
+            let content_len = (best.size > 0).then_some(best.size);
+            if probe_stream_url(&best.url, &ua, content_len).await {
                 let bitrate_kbps = best.bitrate / 1000;
                 let duration_secs = best
                     .duration_ms
@@ -448,14 +452,14 @@ impl YtmClient {
                     codec_label: format!("AAC {} kbps", bitrate_kbps),
                     loudness_db: best.loudness_db,
                     duration_secs,
-                    content_length: (best.size > 0).then_some(best.size),
+                    content_length: content_len,
                 });
             } else {
-                last_err = format!("{client_type:?}: el servidor rechazó el stream (403/timeout)");
+                last_err = format!("{client_type:?}: el servidor rechazó el stream (403/corte >1MB)");
             }
         }
 
-        // Respaldo opcional silencioso si yt-dlp está instalado en el sistema
+        // 3) Respaldo opcional silencioso si yt-dlp está instalado en el sistema
         if let Ok(fallback) = resolve_via_ytdlp_fallback(video_id).await {
             return Ok(fallback);
         }
@@ -493,8 +497,146 @@ fn select_best_compatible_audio(streams: &[AudioStream]) -> Option<&AudioStream>
     candidates.pop()
 }
 
-/// Comprueba con una petición `Range: bytes=0-65535` (igual que `ChunkedYtStream`) que Google entrega audio real.
-async fn probe_stream_url(url: &str, user_agent: &str) -> bool {
+/// Resuelve el stream de audio AAC/M4A completo vía cliente InnerTube `VISIONOS` (sin corte 403 al 1 MB).
+async fn resolve_via_visionos(video_id: &str, visitor_data: Option<&str>) -> Result<ResolvedAudio> {
+    const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+    const VISIONOS_VER: &str = "1.02";
+
+    let client = sd_reqwest::Client::builder()
+        .user_agent(VISIONOS_UA)
+        .timeout(Duration::from_secs(12))
+        .build()
+        .context("No se pudo crear cliente HTTP para VISIONOS")?;
+
+    let mut client_ctx = serde_json::json!({
+        "clientName": "VISIONOS",
+        "clientVersion": VISIONOS_VER,
+        "deviceMake": "Apple",
+        "deviceModel": "RealityDevice17,1",
+        "osName": "visionOS",
+        "osVersion": "26.5.23O471",
+        "hl": "en",
+        "gl": "US"
+    });
+    if let Some(vd) = visitor_data.filter(|s| !s.is_empty()) {
+        client_ctx["visitorData"] = serde_json::Value::String(vd.to_string());
+    }
+
+    let payload = serde_json::json!({
+        "context": { "client": client_ctx },
+        "videoId": video_id,
+        "contentCheckOk": true,
+        "racyCheckOk": true
+    });
+
+    let mut req = client
+        .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+        .header("X-YouTube-Client-Name", "101")
+        .header("X-YouTube-Client-Version", VISIONOS_VER)
+        .header(sd_reqwest::header::CONTENT_TYPE, "application/json")
+        .body(payload.to_string());
+    if let Some(vd) = visitor_data.filter(|s| !s.is_empty()) {
+        req = req.header("X-Goog-Visitor-Id", vd);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .context("Error consultando player VISIONOS")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("VISIONOS HTTP {}", resp.status()));
+    }
+
+    let text = resp
+        .text()
+        .await
+        .context("Error leyendo respuesta VISIONOS")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).context("JSON inválido de VISIONOS")?;
+
+    if json["playabilityStatus"]["status"].as_str() != Some("OK") {
+        let reason = json["playabilityStatus"]["reason"]
+            .as_str()
+            .unwrap_or("UNPLAYABLE");
+        return Err(anyhow!("VISIONOS no reproducible: {reason}"));
+    }
+
+    let formats = json["streamingData"]["adaptiveFormats"]
+        .as_array()
+        .ok_or_else(|| anyhow!("VISIONOS sin adaptiveFormats"))?;
+
+    let best = formats
+        .iter()
+        .filter(|f| {
+            let mime = f["mimeType"].as_str().unwrap_or("");
+            let is_mp4_audio = mime.starts_with("audio/mp4") && mime.contains("mp4a");
+            let has_url = f["url"].as_str().map(|u| !u.is_empty()).unwrap_or(false);
+            let is_drm = f["drmFamilies"].is_array();
+            is_mp4_audio && has_url && !is_drm
+        })
+        .max_by_key(|f| {
+            let track_prio: u8 = match f.get("audioTrack") {
+                None => 3,
+                Some(t)
+                    if t["displayName"]
+                        .as_str()
+                        .map(|d| d.to_ascii_lowercase().contains("original"))
+                        .unwrap_or(false) =>
+                {
+                    3
+                }
+                Some(t) if t["audioIsDefault"].as_bool().unwrap_or(false) => 2,
+                Some(_) => 1,
+            };
+            let br = f["bitrate"].as_u64().unwrap_or(0);
+            let avg = f["averageBitrate"].as_u64().unwrap_or(0);
+            (track_prio, br, avg)
+        })
+        .ok_or_else(|| anyhow!("VISIONOS sin stream AAC/M4A compatible"))?;
+
+    let url = best["url"]
+        .as_str()
+        .ok_or_else(|| anyhow!("VISIONOS stream sin URL"))?
+        .to_string();
+    let content_length = best["contentLength"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0);
+
+    if !probe_stream_url(&url, VISIONOS_UA, content_length).await {
+        return Err(anyhow!("VISIONOS stream rechazado en verificación Range (>1MB)"));
+    }
+
+    let bitrate_bps = best["bitrate"].as_u64().unwrap_or(128_000) as u32;
+    let bitrate_kbps = bitrate_bps / 1000;
+    let duration_secs = best["approxDurationMs"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|ms| (ms / 1000) as u32)
+        .or_else(|| {
+            json["videoDetails"]["lengthSeconds"]
+                .as_str()
+                .and_then(|s| s.parse::<u32>().ok())
+        });
+    let loudness_db = best["loudnessDb"]
+        .as_f64()
+        .or_else(|| json["playerConfig"]["audioConfig"]["loudnessDb"].as_f64())
+        .map(|v| v as f32);
+
+    Ok(ResolvedAudio {
+        url,
+        user_agent: VISIONOS_UA.to_string(),
+        bitrate_kbps,
+        codec_label: format!("AAC {} kbps", bitrate_kbps),
+        loudness_db,
+        duration_secs,
+        content_length,
+    })
+}
+
+/// Comprueba con peticiones `Range` que Google entrega audio real tanto al inicio (`0..64KB`)
+/// como más allá del umbral de 1 MiB (`>1.05MB`) para descartar streams que se cortan con 403 a los ~50s.
+async fn probe_stream_url(url: &str, user_agent: &str, content_length: Option<u64>) -> bool {
     let Ok(client) = sd_reqwest::Client::builder()
         .user_agent(user_agent)
         .timeout(Duration::from_secs(8))
@@ -503,21 +645,40 @@ async fn probe_stream_url(url: &str, user_agent: &str) -> bool {
         return false;
     };
 
-    match client
-        .get(url)
-        .header(sd_reqwest::header::RANGE, "bytes=0-65535")
-        .send()
-        .await
-    {
-        Ok(mut resp) => {
-            let status = resp.status();
-            if !status.is_success() && status != sd_reqwest::StatusCode::PARTIAL_CONTENT {
-                return false;
+    async fn check_range(client: &sd_reqwest::Client, url: &str, range: &str) -> bool {
+        match client
+            .get(url)
+            .header(sd_reqwest::header::RANGE, range)
+            .send()
+            .await
+        {
+            Ok(mut resp) => {
+                let status = resp.status();
+                if !status.is_success() && status != sd_reqwest::StatusCode::PARTIAL_CONTENT {
+                    return false;
+                }
+                matches!(resp.chunk().await, Ok(Some(bytes)) if !bytes.is_empty())
             }
-            matches!(resp.chunk().await, Ok(Some(bytes)) if !bytes.is_empty())
+            Err(_) => false,
         }
-        Err(_) => false,
     }
+
+    if !check_range(&client, url, "bytes=0-65535").await {
+        return false;
+    }
+
+    if let Some(total) = content_length
+        && total > 1_100_000
+    {
+        let start = 1_100_000u64;
+        let end = (start + 65_535).min(total - 1);
+        let late_range = format!("bytes={start}-{end}");
+        if !check_range(&client, url, &late_range).await {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Respaldo opcional si el usuario tiene `yt-dlp` instalado y los clientes nativos fallan.

@@ -177,40 +177,58 @@ fn build_chunk_stream(
         let end = (st.offset + CHUNK_SIZE - 1).min(st.limit - 1);
         let range_header = format!("bytes={}-{end}", st.offset);
 
-        let resp = match st
-            .client
-            .get(&st.url)
-            .header(sd_reqwest::header::RANGE, &range_header)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return Some((Err(io::Error::other(format!("Error HTTP chunk: {e}"))), st));
+        let mut last_err: Option<io::Error> = None;
+        for attempt in 0..3u8 {
+            if attempt > 0 {
+                let backoff_ms = 250u64 * (1u64 << (attempt - 1));
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
-        };
 
-        let status = resp.status();
-        if !status.is_success() && status != sd_reqwest::StatusCode::PARTIAL_CONTENT {
-            return Some((
-                Err(io::Error::other(format!(
+            let resp = match st
+                .client
+                .get(&st.url)
+                .header(sd_reqwest::header::RANGE, &range_header)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(io::Error::other(format!("Error HTTP chunk: {e}")));
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if !status.is_success() && status != sd_reqwest::StatusCode::PARTIAL_CONTENT {
+                let err = io::Error::other(format!(
                     "HTTP {status} descargando bloque {range_header}"
-                ))),
-                st,
-            ));
+                ));
+                // 403/404 no se recuperan reintentando el mismo bloque
+                if status == sd_reqwest::StatusCode::FORBIDDEN
+                    || status == sd_reqwest::StatusCode::NOT_FOUND
+                {
+                    return Some((Err(err), st));
+                }
+                last_err = Some(err);
+                continue;
+            }
+
+            match resp.bytes().await {
+                Ok(bytes) if bytes.is_empty() => return None,
+                Ok(bytes) => {
+                    st.offset += bytes.len() as u64;
+                    return Some((Ok(bytes), st));
+                }
+                Err(e) => {
+                    last_err = Some(io::Error::other(format!("Error leyendo bloque: {e}")));
+                }
+            }
         }
 
-        match resp.bytes().await {
-            Ok(bytes) if bytes.is_empty() => None,
-            Ok(bytes) => {
-                st.offset += bytes.len() as u64;
-                Some((Ok(bytes), st))
-            }
-            Err(e) => Some((
-                Err(io::Error::other(format!("Error leyendo bloque: {e}"))),
-                st,
-            )),
-        }
+        Some((
+            Err(last_err.unwrap_or_else(|| io::Error::other("Error descargando bloque de audio"))),
+            st,
+        ))
     }))
 }
 

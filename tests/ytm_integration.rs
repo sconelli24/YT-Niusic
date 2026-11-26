@@ -87,9 +87,13 @@ async fn ytm_live_search_radio_and_stream() {
         .expect("prepare_decoded_stream via ChunkedYtStream");
     println!("Decoded duration: {total_dur:?}");
 
+    // Verifica que podemos hacer seek más allá de los 70 segundos (>1 MB, superando el antiguo corte de 50s)
+    // y seguir decodificando muestras PCM reales sin errores 403.
     let decoded_samples = tokio::task::spawn_blocking(move || {
+        use rodio::Source;
+        let _ = decoder.try_seek(std::time::Duration::from_secs(75));
         let mut count = 0usize;
-        for _ in 0..4096 {
+        for _ in 0..8192 {
             if decoder.next().is_some() {
                 count += 1;
             } else {
@@ -101,8 +105,11 @@ async fn ytm_live_search_radio_and_stream() {
     .await
     .expect("join decode task");
 
-    println!("Decoded PCM samples verified: {decoded_samples}");
-    assert_eq!(decoded_samples, 4096, "should decode live AAC audio frames");
+    println!("Decoded PCM samples verified past 75s: {decoded_samples}");
+    assert_eq!(
+        decoded_samples, 8192,
+        "should decode live AAC audio frames past the 1MB/50s mark"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
