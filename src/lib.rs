@@ -5,4 +5,5 @@ pub mod media_keys;
 pub mod queue;
 pub mod security;
 pub mod tui;
+pub mod updater;
 pub mod ytm;

@@ -25,6 +25,10 @@ use crate::config::{AppPaths, AppSettings};
 use crate::media_keys::{MediaKeysHandle, OsMediaEvent};
 use crate::queue::{PlaybackQueue, RadioFetchRequest, RadioSeed};
 use crate::security::{cleanup_stale_auth_profiles, ENCRYPTED_SESSION_FILE};
+use crate::updater::{
+    check_for_updates, cleanup_previous_update_artifacts, download_and_install_update, UpdateInfo,
+    CURRENT_VERSION,
+};
 use crate::ytm::{
     AlbumDetail, AlbumSummary, AuthStatus, OAuthSession, RadioPage, ResolvedAudio, Track, YtmClient,
 };
@@ -97,6 +101,8 @@ enum AsyncEvent {
     SessionVerified(Result<(), String>),
     OAuthStarted(Result<OAuthSession, String>),
     OAuthPolled(Result<bool, String>),
+    UpdateAvailable(UpdateInfo),
+    UpdateFinished(Result<String, String>),
 }
 
 struct TerminalGuard;
@@ -158,6 +164,9 @@ struct TuiApp {
     oauth_pending: Option<OAuthSession>,
     last_oauth_poll: Instant,
 
+    available_update: Option<UpdateInfo>,
+    updating: bool,
+
     should_quit: bool,
 }
 
@@ -171,6 +180,7 @@ impl TuiApp {
         tx: mpsc::UnboundedSender<AsyncEvent>,
     ) -> Self {
         cleanup_stale_auth_profiles(&paths.data_dir);
+        cleanup_previous_update_artifacts();
 
         let auth_status = ytm.auth_status();
         let detected_browser_name = detect_chromium_browser().map(|b| b.name);
@@ -240,8 +250,18 @@ impl TuiApp {
             auth_feedback: None,
             oauth_pending: None,
             last_oauth_poll: Instant::now(),
+            available_update: None,
+            updating: false,
             should_quit: false,
         };
+
+        // Comprobación silenciosa de actualizaciones en GitHub Releases al arrancar
+        let tx_upd = app.tx.clone();
+        tokio::spawn(async move {
+            if let Some(info) = check_for_updates().await {
+                let _ = tx_upd.send(AsyncEvent::UpdateAvailable(info));
+            }
+        });
 
         if auth_status.has_cookie {
             app.load_library(LibrarySection::History);
@@ -368,6 +388,29 @@ impl TuiApp {
                 .map(|_| "SESSION CLEARED FROM DPAPI STORAGE".to_string())
                 .map_err(|e| e.to_string());
             let _ = tx.send(AsyncEvent::AuthDone(res));
+        });
+    }
+
+    fn start_update(&mut self) {
+        if self.updating {
+            return;
+        }
+        let Some(info) = self.available_update.clone() else {
+            return;
+        };
+        self.updating = true;
+        let msg = format!("DOWNLOADING UPDATE v{}...", info.version);
+        self.status_line = msg.clone();
+        if self.screen == Screen::Login || self.tab == Tab::Auth {
+            self.auth_feedback = Some(msg);
+        }
+
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let res = download_and_install_update(&info)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AsyncEvent::UpdateFinished(res));
         });
     }
 
@@ -667,6 +710,7 @@ impl TuiApp {
                     self.should_quit = true;
                 }
                 KeyCode::Enter | KeyCode::Char('g') => self.start_browser_login(),
+                KeyCode::Char('u') if self.available_update.is_some() => self.start_update(),
                 KeyCode::Char('o') => self.start_oauth_login(),
                 KeyCode::Char('i') => self.start_cookie_file_import(),
                 KeyCode::Char('c') if !self.auth_busy => {
@@ -846,6 +890,9 @@ impl TuiApp {
                     self.audio
                         .set_normalize_loudness(self.settings.normalize_loudness);
                     self.paths.save_settings(&self.settings);
+                }
+                KeyCode::Char('u') if self.available_update.is_some() => {
+                    self.start_update();
                 }
                 KeyCode::Char('e') => self.enqueue_selected(),
                 KeyCode::Char('d') | KeyCode::Char('x') if self.focus == FocusPane::Queue => {
@@ -1076,6 +1123,33 @@ impl TuiApp {
                     self.auth_feedback = Some(format!("OAUTH ENDED // {e}"));
                 }
             },
+            AsyncEvent::UpdateAvailable(info) => {
+                let notice = format!(
+                    "UPDATE AVAILABLE: v{} (CURRENT v{}) // PRESS [u] TO UPDATE",
+                    info.version, CURRENT_VERSION
+                );
+                self.available_update = Some(info);
+                self.status_line = notice;
+            }
+            AsyncEvent::UpdateFinished(res) => {
+                self.updating = false;
+                match res {
+                    Ok(msg) => {
+                        self.available_update = None;
+                        self.status_line = msg.clone();
+                        if self.screen == Screen::Login || self.tab == Tab::Auth {
+                            self.auth_feedback = Some(msg);
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = format!("UPDATE ERR // {e}");
+                        self.status_line = err_msg.clone();
+                        if self.screen == Screen::Login || self.tab == Tab::Auth {
+                            self.auth_feedback = Some(err_msg);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1362,6 +1436,20 @@ impl TuiApp {
             )));
         }
 
+        if let Some(upd) = &self.available_update {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  [u] NUEVA VERSIÓN DISPONIBLE: v{} (actual v{}) — Presiona [u] para actualizar",
+                    upd.version, CURRENT_VERSION
+                ),
+                Style::default()
+                    .bg(AMBER_MAIN)
+                    .fg(BG_OBSIDIAN)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+
         if let Some(fb) = &self.auth_feedback {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -1437,13 +1525,20 @@ impl TuiApp {
 
         let line1 = Line::from(vec![
             Span::styled(
-                " YT-NIUSIC // AUDIO CONSOLE ",
+                format!(" YT-NIUSIC v{CURRENT_VERSION} // AUDIO CONSOLE "),
                 Style::default()
                     .fg(AMBER_BRIGHT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" │ ", Style::default().fg(BRONZE)),
-            Span::styled(&self.status_line, Style::default().fg(AMBER_DIM)),
+            Span::styled(
+                &self.status_line,
+                Style::default().fg(if self.available_update.is_some() {
+                    AMBER_BRIGHT
+                } else {
+                    AMBER_DIM
+                }),
+            ),
         ]);
 
         let line2 = Line::from(vec![
@@ -1682,6 +1777,20 @@ impl TuiApp {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!(" PASTE COOKIE (Enter=Save, Esc=Cancel) > {masked}_"),
+                Style::default()
+                    .bg(AMBER_MAIN)
+                    .fg(BG_OBSIDIAN)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        if let Some(upd) = &self.available_update {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  [u] NUEVA VERSIÓN DISPONIBLE: v{} (actual v{}) — Presiona [u] para actualizar",
+                    upd.version, CURRENT_VERSION
+                ),
                 Style::default()
                     .bg(AMBER_MAIN)
                     .fg(BG_OBSIDIAN)

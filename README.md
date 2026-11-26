@@ -13,6 +13,7 @@ Reproductor de consola (TUI) ultraliviano y retro (**Amber Monochrome Console**)
 - **Radio / Autoplay infinito de Google**: al reproducir cualquier canción o álbum, carga automáticamente la cola *"A continuación"* generada por Google y la recarga de forma indefinida cuando quedan 3 pistas o menos.
 - **Teclas multimedia de Windows (SMTC)**: Play/Pausa/Siguiente/Anterior desde tu teclado físico o auriculares Bluetooth incluso con la terminal minimizada, mostrando título y artista en el overlay multimedia de Windows.
 - **Inicio de sesión directo con Google + cifrado Windows DPAPI**: al abrir la app sin sesión, puedes iniciar sesión directamente en la página oficial de Google (ventana aislada de Edge/Chrome con soporte completo de 2FA/Passkeys). La sesión se captura automáticamente, se cifra con Windows DPAPI y persiste en el dispositivo para no volver a pedir credenciales al reabrir.
+- **Actualizador automático integrado**: al iniciar, comprueba en segundo plano si existe una nueva versión en GitHub Releases y permite actualizar `yt-niusic.exe` presionando `u` directamente desde la app.
 - **Audio eficiente y de alta calidad**: selecciona el stream AAC/M4A de mayor bitrate disponible (hasta 256 kbps con Premium) usando streaming por bloques `Range` de 512 KB, *prefetch* de la siguiente canción y normalización de sonoridad opcional.
 
 ## Privacidad y seguridad de tu cuenta
