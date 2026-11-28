@@ -1,13 +1,16 @@
 pub mod chunked_stream;
 
 use std::io::BufReader;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
+use rodio::{
+    CpalError, CpalErrorKind, Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source,
+};
 use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
@@ -63,6 +66,7 @@ enum AudioCommand {
         duration: Option<Duration>,
         codec_label: String,
         loudness_db: Option<f32>,
+        seek_to: Option<Duration>,
     },
     LoadFailed {
         generation: u64,
@@ -201,6 +205,77 @@ impl Drop for AudioEngine {
     }
 }
 
+fn open_output_sink(sink_invalidated: Arc<AtomicBool>) -> Result<MixerDeviceSink> {
+    let make_cb = || {
+        let flag = sink_invalidated.clone();
+        move |err: CpalError| {
+            tracing::debug!("Evento del stream de audio (CPAL): {err}");
+            if matches!(
+                err.kind(),
+                CpalErrorKind::StreamInvalidated | CpalErrorKind::DeviceNotAvailable
+            ) {
+                flag.store(true, Ordering::Release);
+            }
+        }
+    };
+
+    let primary = DeviceSinkBuilder::from_default_device()
+        .and_then(|b| b.with_error_callback(make_cb()).open_sink_or_fallback());
+
+    let mut sink = match primary {
+        Ok(s) => s,
+        Err(original_err) => {
+            let devices = rodio::cpal::default_host()
+                .output_devices()
+                .map_err(|_| anyhow!("No se pudo abrir el dispositivo de salida de audio: {original_err}"))?;
+
+            devices
+                .filter(|dev| {
+                    dev.description()
+                        .map(|desc| desc.driver().is_some_and(|driver| driver != "null"))
+                        .unwrap_or(false)
+                })
+                .find_map(|d| {
+                    DeviceSinkBuilder::from_device(d)
+                        .and_then(|b| b.with_error_callback(make_cb()).open_sink_or_fallback())
+                        .ok()
+                })
+                .ok_or_else(|| anyhow!("No se pudo abrir el dispositivo de salida de audio: {original_err}"))?
+        }
+    };
+
+    sink.log_on_drop(false);
+    Ok(sink)
+}
+
+fn rebuild_sink_if_invalidated(
+    sink_invalidated: &Arc<AtomicBool>,
+    device_sink: &mut MixerDeviceSink,
+    player: &mut Player,
+    user_volume: f32,
+    loudness_db: Option<f32>,
+    normalize_loudness: bool,
+) {
+    if sink_invalidated.swap(false, Ordering::AcqRel) {
+        match open_output_sink(sink_invalidated.clone()) {
+            Ok(new_sink) => {
+                player.stop();
+                *device_sink = new_sink;
+                *player = Player::connect_new(device_sink.mixer());
+                player.set_volume(effective_volume(
+                    user_volume,
+                    loudness_db,
+                    normalize_loudness,
+                ));
+            }
+            Err(e) => {
+                tracing::debug!("No se pudo reconstruir el dispositivo de audio: {e}");
+                sink_invalidated.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_audio_thread(
     cmd_rx: mpsc::Receiver<AudioCommand>,
@@ -212,15 +287,14 @@ fn run_audio_thread(
     initial_normalize: bool,
     init_tx: mpsc::SyncSender<Result<()>>,
 ) {
-    let device_sink = match DeviceSinkBuilder::open_default_sink() {
+    let sink_invalidated = Arc::new(AtomicBool::new(false));
+    let mut device_sink = match open_output_sink(sink_invalidated.clone()) {
         Ok(sink) => {
             let _ = init_tx.send(Ok(()));
             sink
         }
         Err(e) => {
-            let _ = init_tx.send(Err(anyhow!(
-                "No se pudo abrir el dispositivo de salida de audio: {e}"
-            )));
+            let _ = init_tx.send(Err(e));
             return;
         }
     };
@@ -230,7 +304,11 @@ fn run_audio_thread(
     let mut normalize_loudness = initial_normalize;
     let mut current_loudness_db: Option<f32> = None;
     let mut active_track_id: Option<String> = None;
+    let mut current_stream: Option<ResolvedAudio> = None;
     let mut playback_started = false;
+    let mut last_pos_sample = Duration::ZERO;
+    let mut stalled_ticks: u8 = 0;
+    let mut recovered_for_gen: Option<u64> = None;
 
     player.set_volume(effective_volume(
         user_volume,
@@ -245,12 +323,24 @@ fn run_audio_thread(
                 track_id,
                 stream,
             }) => {
+                rebuild_sink_if_invalidated(
+                    &sink_invalidated,
+                    &mut device_sink,
+                    &mut player,
+                    user_volume,
+                    stream.loudness_db,
+                    normalize_loudness,
+                );
                 // Detenemos inmediatamente la pista anterior
                 player.stop();
                 player = Player::connect_new(device_sink.mixer());
                 player.set_volume(effective_volume(user_volume, stream.loudness_db, normalize_loudness));
                 playback_started = false;
                 active_track_id = Some(track_id.clone());
+                current_stream = Some(stream.clone());
+                last_pos_sample = Duration::ZERO;
+                stalled_ticks = 0;
+                recovered_for_gen = None;
 
                 let tx = cmd_tx.clone();
                 let gen_ref = generation.clone();
@@ -274,6 +364,7 @@ fn run_audio_thread(
                                 duration,
                                 codec_label: stream.codec_label,
                                 loudness_db: stream.loudness_db,
+                                seek_to: None,
                             });
                         }
                         Err(e) => {
@@ -295,6 +386,7 @@ fn run_audio_thread(
                 duration,
                 codec_label,
                 loudness_db,
+                seek_to,
             }) => {
                 if generation.load(Ordering::SeqCst) != req_gen {
                     continue;
@@ -308,14 +400,23 @@ fn run_audio_thread(
                     normalize_loudness,
                 ));
                 player.append(source);
+                let mut initial_pos = Duration::ZERO;
+                if let Some(seek_pos) = seek_to
+                    && seek_pos > Duration::ZERO
+                {
+                    let _ = player.try_seek(seek_pos);
+                    initial_pos = seek_pos;
+                }
                 player.play();
                 active_track_id = Some(track_id.clone());
                 playback_started = true;
+                last_pos_sample = initial_pos;
+                stalled_ticks = 0;
 
                 let mut snap = snapshot.lock().unwrap();
                 snap.status = PlaybackStatus::Playing;
                 snap.track_id = Some(track_id);
-                snap.position = Duration::ZERO;
+                snap.position = initial_pos;
                 snap.duration = duration;
                 snap.codec_label = Some(codec_label);
                 snap.ended_track_id = None;
@@ -360,6 +461,10 @@ fn run_audio_thread(
                 player.stop();
                 playback_started = false;
                 active_track_id = None;
+                current_stream = None;
+                last_pos_sample = Duration::ZERO;
+                stalled_ticks = 0;
+                recovered_for_gen = None;
                 let mut snap = snapshot.lock().unwrap();
                 snap.status = PlaybackStatus::Idle;
                 snap.position = Duration::ZERO;
@@ -370,6 +475,8 @@ fn run_audio_thread(
                     if let Err(e) = player.try_seek(pos) {
                         tracing::debug!("Seek no soportado o fuera de rango: {e:?}");
                     } else {
+                        last_pos_sample = pos;
+                        stalled_ticks = 0;
                         snapshot.lock().unwrap().position = pos;
                     }
                 }
@@ -394,13 +501,27 @@ fn run_audio_thread(
                 player.stop();
                 break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !playback_started && sink_invalidated.load(Ordering::Acquire) {
+                    rebuild_sink_if_invalidated(
+                        &sink_invalidated,
+                        &mut device_sink,
+                        &mut player,
+                        user_volume,
+                        current_loudness_db,
+                        normalize_loudness,
+                    );
+                }
+            }
         }
 
         // Actualizamos progreso o detectamos fin natural de pista
         if playback_started {
             if player.empty() {
                 playback_started = false;
+                current_stream = None;
+                last_pos_sample = Duration::ZERO;
+                stalled_ticks = 0;
                 let finished_id = active_track_id.take();
                 let mut snap = snapshot.lock().unwrap();
                 snap.status = PlaybackStatus::Idle;
@@ -408,13 +529,97 @@ fn run_audio_thread(
             } else {
                 let pos = player.get_pos();
                 let paused = player.is_paused();
-                let mut snap = snapshot.lock().unwrap();
-                snap.position = pos;
-                snap.status = if paused {
-                    PlaybackStatus::Paused
+                {
+                    let mut snap = snapshot.lock().unwrap();
+                    snap.position = pos;
+                    snap.status = if paused {
+                        PlaybackStatus::Paused
+                    } else {
+                        PlaybackStatus::Playing
+                    };
+                }
+
+                if !paused && sink_invalidated.load(Ordering::Acquire) {
+                    if pos == last_pos_sample {
+                        stalled_ticks = stalled_ticks.saturating_add(1);
+                    } else {
+                        last_pos_sample = pos;
+                        stalled_ticks = 0;
+                    }
+
+                    if stalled_ticks >= 10
+                        && recovered_for_gen != Some(generation.load(Ordering::SeqCst))
+                        && let (Some(tid), Some(stream)) =
+                            (active_track_id.clone(), current_stream.clone())
+                    {
+                        match open_output_sink(sink_invalidated.clone()) {
+                            Ok(new_sink) => {
+                                sink_invalidated.store(false, Ordering::Release);
+                                stalled_ticks = 0;
+                                player.stop();
+                                device_sink = new_sink;
+                                player = Player::connect_new(device_sink.mixer());
+                                player.set_volume(effective_volume(
+                                    user_volume,
+                                    stream.loudness_db,
+                                    normalize_loudness,
+                                ));
+                                playback_started = false;
+
+                                let req_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
+                                recovered_for_gen = Some(req_gen);
+
+                                let tx = cmd_tx.clone();
+                                let gen_ref = generation.clone();
+                                let rt = runtime.clone();
+                                rt.spawn(async move {
+                                    if gen_ref.load(Ordering::SeqCst) != req_gen {
+                                        return;
+                                    }
+                                    match prepare_decoded_stream(&stream).await {
+                                        Ok((source, decoded_dur)) => {
+                                            if gen_ref.load(Ordering::SeqCst) != req_gen {
+                                                return;
+                                            }
+                                            let duration = decoded_dur.or_else(|| {
+                                                stream
+                                                    .duration_secs
+                                                    .map(|s| Duration::from_secs(s.into()))
+                                            });
+                                            let _ = tx.send(AudioCommand::Prepared {
+                                                generation: req_gen,
+                                                track_id: tid,
+                                                source,
+                                                duration,
+                                                codec_label: stream.codec_label,
+                                                loudness_db: stream.loudness_db,
+                                                seek_to: Some(pos),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            if gen_ref.load(Ordering::SeqCst) != req_gen {
+                                                return;
+                                            }
+                                            let _ = tx.send(AudioCommand::LoadFailed {
+                                                generation: req_gen,
+                                                error: e.to_string(),
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Reintento de dispositivo de audio tras bloqueo falló: {e}"
+                                );
+                                stalled_ticks = 0;
+                            }
+                        }
+                    }
                 } else {
-                    PlaybackStatus::Playing
-                };
+                    last_pos_sample = pos;
+                    stalled_ticks = 0;
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "yt-niusic"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/sconelli24/YT-Niusic"
@@ -14,10 +14,11 @@ directories = "6.0"
 futures-util = "0.3"
 ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
 rfd = "0.18.0"
-rodio = { version = "0.23.0", default-features = false, features = ["playback", "symphonia-all"] }
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "symphonia-all", "tracing"] }
 rustypipe = { version = "0.11.4", features = ["userdata"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha1 = "0.10"
 souvlaki = { version = "0.9.3", default-features = false }
 stream-download = "0.24.7"
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "process"] }

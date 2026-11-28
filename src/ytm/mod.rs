@@ -1,14 +1,17 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use rustypipe::cache::CacheStorage;
 use rustypipe::client::{ClientType, OauthDeviceCode, RustyPipe, RustyPipeQuery};
 use rustypipe::model::paginator::ContinuationEndpoint;
 use rustypipe::model::{
     AlbumItem, AlbumType, AudioCodec, AudioStream, AudioTrackType, MusicAlbum, Thumbnail,
     TrackItem,
 };
+use serde::Deserialize;
+use sha1::{Digest, Sha1};
 use stream_download::http::reqwest as sd_reqwest;
 use zeroize::Zeroizing;
 
@@ -66,6 +69,14 @@ pub struct ResolvedAudio {
     pub content_length: Option<u64>,
 }
 
+/// Estado de calificación ("Me gusta" / "No me gusta") de una canción en YouTube Music.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LikeStatus {
+    Like,
+    Dislike,
+    Indifferent,
+}
+
 /// Estado local de vinculación de cuenta (sin exponer ningún secreto).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AuthStatus {
@@ -103,6 +114,7 @@ impl std::fmt::Debug for OAuthSession {
 #[derive(Clone)]
 pub struct YtmClient {
     rp: RustyPipe,
+    storage_dir: PathBuf,
 }
 
 impl YtmClient {
@@ -116,7 +128,10 @@ impl YtmClient {
             .build()
             .context("No se pudo inicializar el cliente de YouTube Music")?;
 
-        Ok(Self { rp })
+        Ok(Self {
+            rp,
+            storage_dir: storage_dir.to_path_buf(),
+        })
     }
 
     /// Devuelve el estado de autenticación local sin consultar la red.
@@ -468,6 +483,227 @@ impl YtmClient {
             "No se pudo obtener un stream reproducible para {video_id}: {last_err}"
         ))
     }
+
+    /// Consulta en YouTube Music si la canción actual tiene Me gusta, No me gusta o ninguno.
+    pub async fn get_track_like_status(&self, video_id: &str) -> Result<LikeStatus> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("videoId".into(), serde_json::Value::String(video_id.to_string()));
+        fields.insert(
+            "enablePersistentPlaylistPanel".into(),
+            serde_json::Value::Bool(true),
+        );
+        fields.insert("isAudioOnly".into(), serde_json::Value::Bool(true));
+
+        let json = self.ytm_authed_post("next", fields).await?;
+        Ok(extract_like_status_from_next(&json, video_id).unwrap_or(LikeStatus::Indifferent))
+    }
+
+    /// Envía calificación Like, Dislike o Indifferent (quitar voto) a YouTube Music.
+    pub async fn rate_track(&self, video_id: &str, status: LikeStatus) -> Result<()> {
+        let endpoint = match status {
+            LikeStatus::Like => "like/like",
+            LikeStatus::Dislike => "like/dislike",
+            LikeStatus::Indifferent => "like/removelike",
+        };
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "target".into(),
+            serde_json::json!({ "videoId": video_id }),
+        );
+        self.ytm_authed_post(endpoint, fields).await?;
+        Ok(())
+    }
+
+    async fn ytm_authed_post(
+        &self,
+        endpoint: &str,
+        extra_fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        const YTM_ORIGIN: &str = "https://music.youtube.com";
+        const YTM_WEB_REMIX_VER: &str = "1.20241216.01.00";
+        const YTM_UA: &str =
+            "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+        let raw_json = Zeroizing::new(
+            EncryptedCacheStorage::new(&self.storage_dir)
+                .read()
+                .ok_or_else(|| anyhow!("No hay sesión de Google guardada (requiere cookies)"))?,
+        );
+        let parsed: StoredCacheSubset = serde_json::from_str(&raw_json)
+            .context("No se pudo leer la sesión cifrada local")?;
+        let auth = parsed
+            .auth_cookie
+            .ok_or_else(|| anyhow!("Inicia sesión con Google para usar Me gusta / No me gusta"))?;
+
+        let sapisidhash = build_sapisidhash(&auth.cookie, YTM_ORIGIN)
+            .ok_or_else(|| anyhow!("Falta cookie SAPISID para firmar la petición a YouTube Music"))?;
+
+        let client = sd_reqwest::Client::builder()
+            .user_agent(YTM_UA)
+            .timeout(Duration::from_secs(12))
+            .build()
+            .context("No se pudo crear cliente HTTP para YouTube Music")?;
+
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "context".into(),
+            serde_json::json!({
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": YTM_WEB_REMIX_VER,
+                    "hl": "en",
+                    "gl": "US"
+                }
+            }),
+        );
+        for (k, v) in extra_fields {
+            body.insert(k, v);
+        }
+
+        let url = format!("{YTM_ORIGIN}/youtubei/v1/{endpoint}?prettyPrint=false");
+        let mut req = client
+            .post(url)
+            .header(sd_reqwest::header::ORIGIN, YTM_ORIGIN)
+            .header(sd_reqwest::header::REFERER, YTM_ORIGIN)
+            .header(sd_reqwest::header::CONTENT_TYPE, "application/json")
+            .header("X-YouTube-Client-Name", "67")
+            .header("X-YouTube-Client-Version", YTM_WEB_REMIX_VER)
+            .header(sd_reqwest::header::AUTHORIZATION, sapisidhash)
+            .header(sd_reqwest::header::COOKIE, &auth.cookie)
+            .header("X-Goog-AuthUser", auth.session_index.as_deref().unwrap_or("0"))
+            .body(serde_json::Value::Object(body).to_string());
+
+        if let Some(page_id) = auth.channel_syncid.as_deref() {
+            req = req.header("X-Goog-PageId", page_id);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .context("Error de red al comunicarse con YouTube Music")?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .context("Error leyendo respuesta de YouTube Music")?;
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "YouTube Music rechazó la petición ({status}): {}",
+                text.chars().take(160).collect::<String>()
+            ));
+        }
+
+        serde_json::from_str(&text).context("Respuesta JSON inválida de YouTube Music")
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredCacheSubset {
+    auth_cookie: Option<StoredAuthCookie>,
+}
+
+#[derive(Deserialize)]
+struct StoredAuthCookie {
+    cookie: String,
+    #[serde(alias = "account_syncid")]
+    channel_syncid: Option<String>,
+    session_index: Option<String>,
+}
+
+fn build_sapisidhash(cookie: &str, origin: &str) -> Option<String> {
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    build_sapisidhash_at(cookie, origin, unix_secs)
+}
+
+fn build_sapisidhash_at(cookie: &str, origin: &str, unix_secs: u64) -> Option<String> {
+    let sapisid = cookie
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("SAPISID="))
+        .or_else(|| {
+            cookie
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("__Secure-3PAPISID="))
+        })?
+        .trim();
+
+    if sapisid.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha1::new();
+    hasher.update(unix_secs.to_string().as_bytes());
+    hasher.update(b" ");
+    hasher.update(sapisid.as_bytes());
+    hasher.update(b" ");
+    hasher.update(origin.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Some(format!("SAPISIDHASH {unix_secs}_{hex}"))
+}
+
+fn parse_like_str(s: &str) -> Option<LikeStatus> {
+    match s {
+        "LIKE" => Some(LikeStatus::Like),
+        "DISLIKE" => Some(LikeStatus::Dislike),
+        "INDIFFERENT" => Some(LikeStatus::Indifferent),
+        _ => None,
+    }
+}
+
+fn extract_like_status_from_next(json: &serde_json::Value, video_id: &str) -> Option<LikeStatus> {
+    fn walk(val: &serde_json::Value, target_vid: Option<&str>) -> Option<LikeStatus> {
+        match val {
+            serde_json::Value::Object(map) => {
+                if let Some(renderer) = map.get("likeButtonRenderer").and_then(|v| v.as_object()) {
+                    let status = renderer
+                        .get("likeStatus")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_like_str);
+                    if let Some(st) = status {
+                        match target_vid {
+                            Some(vid) => {
+                                let matches_target = renderer
+                                    .get("target")
+                                    .and_then(|t| t.get("videoId"))
+                                    .and_then(|v| v.as_str())
+                                    == Some(vid);
+                                if matches_target {
+                                    return Some(st);
+                                }
+                            }
+                            None => return Some(st),
+                        }
+                    }
+                }
+                for child in map.values() {
+                    if let Some(found) = walk(child, target_vid) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    if let Some(found) = walk(item, target_vid) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    walk(json, Some(video_id)).or_else(|| walk(json, None))
 }
 
 /// Selecciona el stream de audio no-DRM compatible con Symphonia/Rodio de mayor bitrate.
@@ -799,5 +1035,74 @@ fn map_album_detail(a: MusicAlbum) -> AlbumDetail {
         summary,
         tracks,
         playlist_id: a.playlist_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sapisidhash_prefers_sapisid_and_computes_known_vector() {
+        let cookie = "__Secure-3PAPISID=fallback_val; SAPISID=test_sapisid; SID=abc";
+        let auth = build_sapisidhash_at(cookie, "https://music.youtube.com", 1_700_000_000)
+            .expect("should build SAPISIDHASH");
+
+        // echo -n "1700000000 test_sapisid https://music.youtube.com" | sha1sum
+        let mut expected = Sha1::new();
+        expected.update(b"1700000000 test_sapisid https://music.youtube.com");
+        let digest = expected.finalize();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(auth, format!("SAPISIDHASH 1700000000_{hex}"));
+
+        // Fallback a __Secure-3PAPISID cuando falta SAPISID
+        let fallback_cookie = "__Secure-3PAPISID=only_3p; SID=abc";
+        let auth_fb =
+            build_sapisidhash_at(fallback_cookie, "https://music.youtube.com", 1_700_000_000)
+                .expect("should fallback to __Secure-3PAPISID");
+        let mut exp_fb = Sha1::new();
+        exp_fb.update(b"1700000000 only_3p https://music.youtube.com");
+        let hex_fb: String = exp_fb.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(auth_fb, format!("SAPISIDHASH 1700000000_{hex_fb}"));
+    }
+
+    #[test]
+    fn extract_like_status_matches_target_video_id_and_fallbacks() {
+        let payload = serde_json::json!({
+            "contents": {
+                "otherTrack": {
+                    "likeButtonRenderer": {
+                        "target": { "videoId": "other_id" },
+                        "likeStatus": "DISLIKE"
+                    }
+                },
+                "playerOverlay": {
+                    "likeButtonRenderer": {
+                        "target": { "videoId": "target_123" },
+                        "likeStatus": "LIKE"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            extract_like_status_from_next(&payload, "target_123"),
+            Some(LikeStatus::Like)
+        );
+        assert_eq!(
+            extract_like_status_from_next(&payload, "other_id"),
+            Some(LikeStatus::Dislike)
+        );
+
+        let fallback_payload = serde_json::json!({
+            "playerOverlays": {
+                "likeButtonRenderer": {
+                    "likeStatus": "INDIFFERENT"
+                }
+            }
+        });
+        assert_eq!(
+            extract_like_status_from_next(&fallback_payload, "any_id"),
+            Some(LikeStatus::Indifferent)
+        );
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,8 @@ use crate::updater::{
     CURRENT_VERSION,
 };
 use crate::ytm::{
-    AlbumDetail, AlbumSummary, AuthStatus, OAuthSession, RadioPage, ResolvedAudio, Track, YtmClient,
+    AlbumDetail, AlbumSummary, AuthStatus, LikeStatus, OAuthSession, RadioPage, ResolvedAudio,
+    Track, YtmClient,
 };
 
 // === Paleta Amber Monochrome Console (24-bit RGB) ===
@@ -103,6 +105,17 @@ enum AsyncEvent {
     OAuthPolled(Result<bool, String>),
     UpdateAvailable(UpdateInfo),
     UpdateFinished(Result<String, String>),
+    TrackRatingLoaded {
+        track_id: String,
+        result: Result<LikeStatus, String>,
+    },
+    TrackRatingSaved {
+        track_id: String,
+        track_title: String,
+        target: LikeStatus,
+        previous: Option<LikeStatus>,
+        result: Result<(), String>,
+    },
 }
 
 struct TerminalGuard;
@@ -166,6 +179,10 @@ struct TuiApp {
 
     available_update: Option<UpdateInfo>,
     updating: bool,
+
+    track_ratings: HashMap<String, LikeStatus>,
+    rating_loading_for: Option<String>,
+    rating_saving: bool,
 
     should_quit: bool,
 }
@@ -252,6 +269,9 @@ impl TuiApp {
             last_oauth_poll: Instant::now(),
             available_update: None,
             updating: false,
+            track_ratings: HashMap::new(),
+            rating_loading_for: None,
+            rating_saving: false,
             should_quit: false,
         };
 
@@ -490,6 +510,25 @@ impl TuiApp {
         self.media_keys.update_metadata(&track, self.duration);
         self.media_keys.update_playback(true, false, Some(Duration::ZERO));
 
+        if self.auth_status.has_cookie {
+            self.rating_loading_for = Some(track.id.clone());
+            let ytm_like = self.ytm.clone();
+            let tx_like = self.tx.clone();
+            let tid_like = track.id.clone();
+            tokio::spawn(async move {
+                let res = ytm_like
+                    .get_track_like_status(&tid_like)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = tx_like.send(AsyncEvent::TrackRatingLoaded {
+                    track_id: tid_like,
+                    result: res,
+                });
+            });
+        } else {
+            self.rating_loading_for = None;
+        }
+
         if let Some((cached_id, stream)) = self.prefetched.take()
             && cached_id == track.id
         {
@@ -693,6 +732,45 @@ impl TuiApp {
         }
     }
 
+    fn rate_current_track(&mut self, desired: LikeStatus) {
+        if !self.auth_status.has_cookie {
+            self.status_line =
+                "LOGIN REQUIRED // PRESS [4] TO SIGN IN WITH GOOGLE TO RATE".to_string();
+            return;
+        }
+        if self.rating_saving {
+            return;
+        }
+        let Some(curr) = self.queue.current().cloned() else {
+            return;
+        };
+        let previous = self.track_ratings.get(&curr.id).copied();
+        let target = if previous == Some(desired) {
+            LikeStatus::Indifferent
+        } else {
+            desired
+        };
+        self.track_ratings.insert(curr.id.clone(), target);
+        self.rating_saving = true;
+        self.status_line = "SYNCING RATING WITH YOUTUBE MUSIC...".to_string();
+
+        let ytm = self.ytm.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let res = ytm
+                .rate_track(&curr.id, target)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(AsyncEvent::TrackRatingSaved {
+                track_id: curr.id,
+                track_title: curr.title,
+                target,
+                previous,
+                result: res,
+            });
+        });
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -891,6 +969,12 @@ impl TuiApp {
                         .set_normalize_loudness(self.settings.normalize_loudness);
                     self.paths.save_settings(&self.settings);
                 }
+                KeyCode::Char('L') | KeyCode::Char('f') => {
+                    self.rate_current_track(LikeStatus::Like);
+                }
+                KeyCode::Char('D') => {
+                    self.rate_current_track(LikeStatus::Dislike);
+                }
                 KeyCode::Char('u') if self.available_update.is_some() => {
                     self.start_update();
                 }
@@ -977,6 +1061,11 @@ impl TuiApp {
                 if sec == self.library_section {
                     match res {
                         Ok(tracks) => {
+                            if sec == LibrarySection::Liked {
+                                for t in &tracks {
+                                    self.track_ratings.insert(t.id.clone(), LikeStatus::Like);
+                                }
+                            }
                             self.library_tracks = tracks;
                             self.catalog_state.select(Some(0));
                         }
@@ -1084,6 +1173,8 @@ impl TuiApp {
                         } else {
                             self.library_tracks.clear();
                             self.library_albums.clear();
+                            self.track_ratings.clear();
+                            self.rating_loading_for = None;
                         }
                     }
                     Err(e) => self.auth_feedback = Some(format!("ERR // {e}")),
@@ -1147,6 +1238,57 @@ impl TuiApp {
                         if self.screen == Screen::Login || self.tab == Tab::Auth {
                             self.auth_feedback = Some(err_msg);
                         }
+                    }
+                }
+            }
+            AsyncEvent::TrackRatingLoaded { track_id, result } => {
+                if self.rating_loading_for.as_deref() == Some(track_id.as_str()) {
+                    self.rating_loading_for = None;
+                }
+                if let Ok(status) = result {
+                    self.track_ratings.insert(track_id, status);
+                }
+            }
+            AsyncEvent::TrackRatingSaved {
+                track_id,
+                track_title,
+                target,
+                previous,
+                result,
+            } => {
+                self.rating_saving = false;
+                match result {
+                    Ok(()) => {
+                        self.track_ratings.insert(track_id.clone(), target);
+                        self.status_line = match target {
+                            LikeStatus::Like => format!("LIKED ♥ // {track_title}"),
+                            LikeStatus::Dislike => format!("DISLIKED ✕ // {track_title}"),
+                            LikeStatus::Indifferent => format!("RATING CLEARED // {track_title}"),
+                        };
+                        if self.library_section == LibrarySection::Liked
+                            && target != LikeStatus::Like
+                        {
+                            self.library_tracks.retain(|t| t.id != track_id);
+                            let len = self.library_tracks.len();
+                            if len == 0 {
+                                self.catalog_state.select(None);
+                            } else if let Some(sel) = self.catalog_state.selected()
+                                && sel >= len
+                            {
+                                self.catalog_state.select(Some(len - 1));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        match previous {
+                            Some(prev) => {
+                                self.track_ratings.insert(track_id, prev);
+                            }
+                            None => {
+                                self.track_ratings.remove(&track_id);
+                            }
+                        }
+                        self.status_line = format!("RATE ERR: {e}");
                     }
                 }
             }
@@ -1609,7 +1751,15 @@ impl TuiApp {
             alb.tracks
                 .iter()
                 .enumerate()
-                .map(|(i, t)| format_track_item(i + 1, t, current_id == Some(t.id.as_str()), inner_width))
+                .map(|(i, t)| {
+                    format_track_item(
+                        i + 1,
+                        t,
+                        current_id == Some(t.id.as_str()),
+                        self.track_ratings.get(&t.id).copied(),
+                        inner_width,
+                    )
+                })
                 .collect()
         } else {
             match self.tab {
@@ -1628,6 +1778,7 @@ impl TuiApp {
                                     i + 1,
                                     t,
                                     current_id == Some(t.id.as_str()),
+                                    self.track_ratings.get(&t.id).copied(),
                                     inner_width,
                                 )
                             })
@@ -1674,6 +1825,7 @@ impl TuiApp {
                                     i + 1,
                                     t,
                                     current_id == Some(t.id.as_str()),
+                                    self.track_ratings.get(&t.id).copied(),
                                     inner_width,
                                 )
                             })
@@ -1843,7 +1995,15 @@ impl TuiApp {
                 .upcoming()
                 .iter()
                 .enumerate()
-                .map(|(i, t)| format_track_item(i + 1, t, false, inner_width))
+                .map(|(i, t)| {
+                    format_track_item(
+                        i + 1,
+                        t,
+                        false,
+                        self.track_ratings.get(&t.id).copied(),
+                        inner_width,
+                    )
+                })
                 .collect()
         };
 
@@ -1878,7 +2038,7 @@ impl TuiApp {
             } else {
                 "RAW"
             };
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" {state_label}: {} ", t.title),
                     Style::default()
@@ -1886,11 +2046,35 @@ impl TuiApp {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("— {}  ", t.artist), Style::default().fg(AMBER_MAIN)),
-                Span::styled(
-                    format!("[{codec} // {norm}]"),
-                    Style::default().fg(AMBER_DIM),
-                ),
-            ])
+            ];
+            if self.auth_status.has_cookie {
+                match self.track_ratings.get(&t.id).copied() {
+                    Some(LikeStatus::Like) => spans.push(Span::styled(
+                        "[♥ LIKED] ",
+                        Style::default()
+                            .fg(AMBER_BRIGHT)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Some(LikeStatus::Dislike) => spans.push(Span::styled(
+                        "[✕ DISLIKED] ",
+                        Style::default()
+                            .fg(AMBER_ALERT)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Some(LikeStatus::Indifferent) => {
+                        spans.push(Span::styled("[♡] ", Style::default().fg(BRONZE)));
+                    }
+                    None if self.rating_loading_for.as_deref() == Some(t.id.as_str()) => {
+                        spans.push(Span::styled("[…] ", Style::default().fg(BRONZE)));
+                    }
+                    None => {}
+                }
+            }
+            spans.push(Span::styled(
+                format!("[{codec} // {norm}]"),
+                Style::default().fg(AMBER_DIM),
+            ));
+            Line::from(spans)
         } else {
             Line::from(Span::styled(
                 " IDLE // NO TRACK LOADED",
@@ -1945,7 +2129,7 @@ impl TuiApp {
         ]);
 
         let help_line = Line::from(Span::styled(
-            " [/]Find [1-4]Tabs [Tab]Pane [Enter]Play [Space]Pause [n/p]Next/Prev [←/→]Seek [+/-]Vol [a]Autoplay [e]Queue [q]Quit",
+            " [/]Find [1-4]Tabs [Tab]Pane [Enter]Play [Space]Pause [n/p]Next/Prev [←/→]Seek [+/-]Vol [f/L]Like [D]Dislike [v]Norm [a]Autoplay [e]Queue [q]Quit",
             Style::default().fg(BRONZE),
         ));
 
@@ -1954,7 +2138,13 @@ impl TuiApp {
     }
 }
 
-fn format_track_item<'a>(index: usize, track: &Track, is_playing: bool, width: usize) -> ListItem<'a> {
+fn format_track_item<'a>(
+    index: usize,
+    track: &Track,
+    is_playing: bool,
+    rating: Option<LikeStatus>,
+    width: usize,
+) -> ListItem<'a> {
     let dur = track
         .duration_secs
         .map(format_secs)
@@ -1964,11 +2154,17 @@ fn format_track_item<'a>(index: usize, track: &Track, is_playing: bool, width: u
     } else {
         format!("  {:02} ", index)
     };
+    let marker = match rating {
+        Some(LikeStatus::Like) => "♥ ",
+        Some(LikeStatus::Dislike) => "✕ ",
+        _ => "",
+    };
     let label = format!("{} — {}", track.title, track.artist);
-    let max_label = width.saturating_sub(prefix.len() + dur.len() + 2).max(10);
+    let fixed_chars = prefix.chars().count() + marker.chars().count() + dur.chars().count() + 2;
+    let max_label = width.saturating_sub(fixed_chars).max(10);
     let truncated = truncate_str(&label, max_label);
     let pad = max_label.saturating_sub(truncated.chars().count());
-    let line_str = format!("{prefix}{truncated}{} {dur}", " ".repeat(pad));
+    let line_str = format!("{prefix}{marker}{truncated}{} {dur}", " ".repeat(pad));
 
     let style = if is_playing {
         Style::default()

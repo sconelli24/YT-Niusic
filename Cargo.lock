@@ -2859,6 +2859,7 @@ dependencies = [
  "num-rational",
  "symphonia",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -4783,7 +4784,7 @@ dependencies = [
 
 [[package]]
 name = "yt-niusic"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4796,6 +4797,7 @@ dependencies = [
  "rustypipe",
  "serde",
  "serde_json",
+ "sha1",
  "souvlaki",
  "stream-download",
  "tokio",
