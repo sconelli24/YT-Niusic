@@ -15,7 +15,7 @@ Reproductor de consola (TUI) ultraliviano y retro (**Amber Monochrome Console**)
 - **Me gusta / No me gusta sincronizados**: visualiza si la canción actual tiene Like o Dislike y califícala en tiempo real con `f`/`L` o `D` directamente contra tu cuenta de YouTube Music.
 - **Inicio de sesión directo con Google + cifrado Windows DPAPI**: al abrir la app sin sesión, puedes iniciar sesión directamente en la página oficial de Google (ventana aislada de Edge/Chrome con soporte completo de 2FA/Passkeys). La sesión se captura automáticamente, se cifra con Windows DPAPI y persiste en el dispositivo para no volver a pedir credenciales al reabrir.
 - **Actualizador automático integrado**: al iniciar, comprueba en segundo plano si existe una nueva versión en GitHub Releases y permite actualizar `yt-niusic.exe` presionando `u` directamente desde la app.
-- **Audio eficiente y de alta calidad**: selecciona el stream AAC/M4A de mayor bitrate disponible (hasta 256 kbps con Premium) usando streaming por bloques `Range` de 512 KB, *prefetch* de la siguiente canción y normalización de sonoridad opcional.
+- **Audio eficiente y de alta calidad**: selecciona el stream AAC/M4A de mayor bitrate disponible (hasta 256 kbps con Premium) usando streaming por bloques `Range` de 512 KB, *prefetch* de la siguiente canción y normalización de sonoridad automática.
 
 ## Privacidad y seguridad de tu cuenta
 
@@ -42,7 +42,7 @@ cargo build --release
 - `↑/↓` o `j/k` + `Enter`: navegar y reproducir (`Esc`/`Backspace` vuelve desde un álbum)
 - `Espacio`: Play / Pausa · `n`/`p`: Siguiente / Anterior · `←`/`→`: Seek ±10s · `+`/`-`: Volumen
 - `f` / `L`: alternar Me gusta (Like) · `D`: alternar No me gusta (Dislike)
-- `a`: toggle Autoplay (Google Radio) · `e`: agregar a la cola · `v`: toggle normalización · `q`: salir
+- `a`: toggle Autoplay (Google Radio) · `e`: agregar a la cola · `q`: salir
 - En la pantalla inicial (sin sesión): `Enter`/`g` (iniciar sesión con Google), `o` (OAuth TV), `i`/`c` (cookies), `s`/`Esc` (continuar como invitado)
 - En `LIBRARY`: `h` (Historial), `l` (Me gusta), `b` (Álbumes guardados)
 - En `AUTH`: `g` (iniciar sesión con Google en navegador), `o` (OAuth TV), `i` (importar `cookies.txt`), `c` (pegar Cookie enmascarado), `t` (auto-borrar `.txt`), `x` (cerrar sesión completa)

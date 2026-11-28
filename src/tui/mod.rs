@@ -111,7 +111,6 @@ enum AsyncEvent {
     },
     TrackRatingSaved {
         track_id: String,
-        track_title: String,
         target: LikeStatus,
         previous: Option<LikeStatus>,
         result: Result<(), String>,
@@ -752,7 +751,6 @@ impl TuiApp {
         };
         self.track_ratings.insert(curr.id.clone(), target);
         self.rating_saving = true;
-        self.status_line = "SYNCING RATING WITH YOUTUBE MUSIC...".to_string();
 
         let ytm = self.ytm.clone();
         let tx = self.tx.clone();
@@ -763,7 +761,6 @@ impl TuiApp {
                 .map_err(|e| e.to_string());
             let _ = tx.send(AsyncEvent::TrackRatingSaved {
                 track_id: curr.id,
-                track_title: curr.title,
                 target,
                 previous,
                 result: res,
@@ -962,12 +959,6 @@ impl TuiApp {
                     self.paths.save_settings(&self.settings);
                     let req = self.queue.set_autoplay(next);
                     self.dispatch_radio(req);
-                }
-                KeyCode::Char('v') => {
-                    self.settings.normalize_loudness = !self.settings.normalize_loudness;
-                    self.audio
-                        .set_normalize_loudness(self.settings.normalize_loudness);
-                    self.paths.save_settings(&self.settings);
                 }
                 KeyCode::Char('L') | KeyCode::Char('f') => {
                     self.rate_current_track(LikeStatus::Like);
@@ -1251,7 +1242,6 @@ impl TuiApp {
             }
             AsyncEvent::TrackRatingSaved {
                 track_id,
-                track_title,
                 target,
                 previous,
                 result,
@@ -1260,11 +1250,6 @@ impl TuiApp {
                 match result {
                     Ok(()) => {
                         self.track_ratings.insert(track_id.clone(), target);
-                        self.status_line = match target {
-                            LikeStatus::Like => format!("LIKED ♥ // {track_title}"),
-                            LikeStatus::Dislike => format!("DISLIKED ✕ // {track_title}"),
-                            LikeStatus::Indifferent => format!("RATING CLEARED // {track_title}"),
-                        };
                         if self.library_section == LibrarySection::Liked
                             && target != LikeStatus::Like
                         {
@@ -2033,11 +2018,6 @@ impl TuiApp {
 
         let track_line = if let Some(t) = self.queue.current() {
             let codec = self.codec_label.as_deref().unwrap_or("AAC");
-            let norm = if self.settings.normalize_loudness {
-                "NORM"
-            } else {
-                "RAW"
-            };
             let mut spans = vec![
                 Span::styled(
                     format!(" {state_label}: {} ", t.title),
@@ -2071,7 +2051,7 @@ impl TuiApp {
                 }
             }
             spans.push(Span::styled(
-                format!("[{codec} // {norm}]"),
+                format!("[{codec}]"),
                 Style::default().fg(AMBER_DIM),
             ));
             Line::from(spans)
@@ -2129,7 +2109,7 @@ impl TuiApp {
         ]);
 
         let help_line = Line::from(Span::styled(
-            " [/]Find [1-4]Tabs [Tab]Pane [Enter]Play [Space]Pause [n/p]Next/Prev [←/→]Seek [+/-]Vol [f/L]Like [D]Dislike [v]Norm [a]Autoplay [e]Queue [q]Quit",
+            " [/]Find [1-4]Tabs [Tab]Pane [Enter]Play [Space]Pause [n/p]Next/Prev [←/→]Seek [+/-]Vol [f/L]Like [D]Dislike [a]Autoplay [e]Queue [q]Quit",
             Style::default().fg(BRONZE),
         ));
 

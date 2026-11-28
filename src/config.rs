@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 pub struct AppSettings {
     pub volume: f32,
     pub autoplay_enabled: bool,
-    pub normalize_loudness: bool,
 }
 
 impl Default for AppSettings {
@@ -20,7 +19,6 @@ impl Default for AppSettings {
         Self {
             volume: 0.85,
             autoplay_enabled: true,
-            normalize_loudness: true,
         }
     }
 }

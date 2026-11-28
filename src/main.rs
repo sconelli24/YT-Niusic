@@ -13,7 +13,6 @@ async fn main() -> Result<()> {
     let audio = AudioEngine::spawn(
         tokio::runtime::Handle::current(),
         settings.volume,
-        settings.normalize_loudness,
     )?;
 
     run_tui(paths, settings, ytm, audio).await

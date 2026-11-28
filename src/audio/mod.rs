@@ -78,7 +78,6 @@ enum AudioCommand {
     Stop,
     Seek(Duration),
     SetVolume(f32),
-    SetNormalizeLoudness(bool),
     Shutdown,
 }
 
@@ -95,7 +94,6 @@ impl AudioEngine {
     pub fn spawn(
         runtime: tokio::runtime::Handle,
         initial_volume: f32,
-        normalize_loudness: bool,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
         let snapshot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
@@ -117,7 +115,6 @@ impl AudioEngine {
                     gen_clone,
                     rt_clone,
                     initial_volume,
-                    normalize_loudness,
                     init_tx,
                 );
             })
@@ -177,10 +174,6 @@ impl AudioEngine {
 
     pub fn set_volume(&self, volume: f32) {
         let _ = self.cmd_tx.send(AudioCommand::SetVolume(volume.clamp(0.0, 1.0)));
-    }
-
-    pub fn set_normalize_loudness(&self, enabled: bool) {
-        let _ = self.cmd_tx.send(AudioCommand::SetNormalizeLoudness(enabled));
     }
 
     /// Lee el estado actual y consume el flag `ended_track_id` si la canción terminó.
@@ -254,7 +247,6 @@ fn rebuild_sink_if_invalidated(
     player: &mut Player,
     user_volume: f32,
     loudness_db: Option<f32>,
-    normalize_loudness: bool,
 ) {
     if sink_invalidated.swap(false, Ordering::AcqRel) {
         match open_output_sink(sink_invalidated.clone()) {
@@ -262,11 +254,7 @@ fn rebuild_sink_if_invalidated(
                 player.stop();
                 *device_sink = new_sink;
                 *player = Player::connect_new(device_sink.mixer());
-                player.set_volume(effective_volume(
-                    user_volume,
-                    loudness_db,
-                    normalize_loudness,
-                ));
+                player.set_volume(effective_volume(user_volume, loudness_db));
             }
             Err(e) => {
                 tracing::debug!("No se pudo reconstruir el dispositivo de audio: {e}");
@@ -284,7 +272,6 @@ fn run_audio_thread(
     generation: Arc<AtomicU64>,
     runtime: tokio::runtime::Handle,
     initial_volume: f32,
-    initial_normalize: bool,
     init_tx: mpsc::SyncSender<Result<()>>,
 ) {
     let sink_invalidated = Arc::new(AtomicBool::new(false));
@@ -301,7 +288,6 @@ fn run_audio_thread(
 
     let mut player = Player::connect_new(device_sink.mixer());
     let mut user_volume = initial_volume.clamp(0.0, 1.0);
-    let mut normalize_loudness = initial_normalize;
     let mut current_loudness_db: Option<f32> = None;
     let mut active_track_id: Option<String> = None;
     let mut current_stream: Option<ResolvedAudio> = None;
@@ -310,11 +296,7 @@ fn run_audio_thread(
     let mut stalled_ticks: u8 = 0;
     let mut recovered_for_gen: Option<u64> = None;
 
-    player.set_volume(effective_volume(
-        user_volume,
-        current_loudness_db,
-        normalize_loudness,
-    ));
+    player.set_volume(effective_volume(user_volume, current_loudness_db));
 
     loop {
         match cmd_rx.recv_timeout(Duration::from_millis(120)) {
@@ -329,12 +311,11 @@ fn run_audio_thread(
                     &mut player,
                     user_volume,
                     stream.loudness_db,
-                    normalize_loudness,
                 );
                 // Detenemos inmediatamente la pista anterior
                 player.stop();
                 player = Player::connect_new(device_sink.mixer());
-                player.set_volume(effective_volume(user_volume, stream.loudness_db, normalize_loudness));
+                player.set_volume(effective_volume(user_volume, stream.loudness_db));
                 playback_started = false;
                 active_track_id = Some(track_id.clone());
                 current_stream = Some(stream.clone());
@@ -394,11 +375,7 @@ fn run_audio_thread(
                 current_loudness_db = loudness_db;
                 player.stop();
                 player = Player::connect_new(device_sink.mixer());
-                player.set_volume(effective_volume(
-                    user_volume,
-                    current_loudness_db,
-                    normalize_loudness,
-                ));
+                player.set_volume(effective_volume(user_volume, current_loudness_db));
                 player.append(source);
                 let mut initial_pos = Duration::ZERO;
                 if let Some(seek_pos) = seek_to
@@ -483,19 +460,7 @@ fn run_audio_thread(
             }
             Ok(AudioCommand::SetVolume(vol)) => {
                 user_volume = vol.clamp(0.0, 1.0);
-                player.set_volume(effective_volume(
-                    user_volume,
-                    current_loudness_db,
-                    normalize_loudness,
-                ));
-            }
-            Ok(AudioCommand::SetNormalizeLoudness(enabled)) => {
-                normalize_loudness = enabled;
-                player.set_volume(effective_volume(
-                    user_volume,
-                    current_loudness_db,
-                    normalize_loudness,
-                ));
+                player.set_volume(effective_volume(user_volume, current_loudness_db));
             }
             Ok(AudioCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 player.stop();
@@ -509,7 +474,6 @@ fn run_audio_thread(
                         &mut player,
                         user_volume,
                         current_loudness_db,
-                        normalize_loudness,
                     );
                 }
             }
@@ -562,7 +526,6 @@ fn run_audio_thread(
                                 player.set_volume(effective_volume(
                                     user_volume,
                                     stream.loudness_db,
-                                    normalize_loudness,
                                 ));
                                 playback_started = false;
 
@@ -626,10 +589,7 @@ fn run_audio_thread(
 }
 
 /// Normalización de volumen estilo YouTube Music (solo atenúa pistas muy fuertes para evitar clipping).
-fn effective_volume(user_volume: f32, loudness_db: Option<f32>, normalize: bool) -> f32 {
-    if !normalize {
-        return user_volume;
-    }
+fn effective_volume(user_volume: f32, loudness_db: Option<f32>) -> f32 {
     match loudness_db {
         Some(db) if db > 0.0 => {
             let gain = 10f32.powf(-db / 20.0).clamp(0.25, 1.0);
